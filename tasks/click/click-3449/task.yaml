@@ -1,0 +1,8 @@
+id: click-3449
+repository: https://github.com/pallets/click.git
+base_commit: a5f5aa6d4012d256ccca24638f2642fc371e9f77
+problem_file: problem.md
+test_command: pytest -q tests/test_testing.py tests/test_termui.py
+timeout_seconds: 300
+hidden_tests:
+  - hidden_tests/test_regression.py
