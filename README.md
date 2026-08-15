@@ -22,19 +22,29 @@ tests/                       Harness unit tests
 
 ```bash
 uv sync
+export CURSOR_API_KEY="cursor_..."
 uv run pytest
 uv run agent-eval inspect tasks/click/click-3449/task.yaml
 ```
 
 ## First milestone
 
-Implement one complete command that checks out the pinned Click commit in an
-isolated container, lets an agent attempt the issue, mounts the held-out test,
-and records the patch, test result, duration, token usage, and cost:
+The run command checks out the pinned Click commit in a disposable workspace,
+lets a Cursor agent attempt the issue, mounts the held-out test afterward, and
+records the patch, test result, duration, and token usage as JSONL:
 
 ```bash
-uv run agent-eval run tasks/click/click-3449/task.yaml --model <model>
+uv run agent-eval run tasks/click/click-3449/task.yaml --model "your-model-id"
 ```
 
 The held-out tests are public benchmark assets, but they must not be mounted in
 the agent's workspace until its attempt is complete.
+
+Events are appended to `artifacts/evaluations.jsonl` by default. Use
+`--trace-file PATH` to choose another destination. Cost is recorded when the
+agent provider reports it; the current Cursor SDK does not expose monetary cost.
+
+Each task may declare a `setup_command` and `setup_timeout_seconds`. Setup runs
+inside the disposable checkout before the agent starts, so repository
+dependencies are isolated from the harness environment. The Click task uses
+`uv sync` to create its own `.venv`, then scores with `uv run pytest`.

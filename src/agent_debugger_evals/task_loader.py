@@ -18,5 +18,7 @@ def load_task(path: Path) -> EvaluationTask:
         problem=problem_path.read_text(encoding="utf-8"),
         test_command=data["test_command"],
         timeout_seconds=data["timeout_seconds"],
+        setup_command=data.get("setup_command"),
+        setup_timeout_seconds=data.get("setup_timeout_seconds", 300),
         hidden_tests=hidden_tests,
     )
