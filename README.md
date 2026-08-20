@@ -10,8 +10,9 @@ from a pinned pre-fix commit and scores the resulting patch with held-out tests.
 tasks/                       Curated repository tasks and held-out tests
 src/agent_debugger_evals/
   agent.py                   Provider-neutral coding-agent interface
+  artifacts.py               Immutable run artifact persistence
   sandbox.py                 Isolated checkout interface
-  runner.py                  Evaluation orchestration
+  runner.py                  Attempt generation and independent scoring
   scoring.py                 Deterministic test scoring
   tracing.py                 Structured JSONL traces
 dashboard/                   Future trace and regression UI
@@ -27,18 +28,27 @@ uv run pytest
 uv run agent-eval inspect tasks/click/click-3449/task.yaml
 ```
 
-## First milestone
+## Run an evaluation
 
-The run command checks out the pinned Click commit in a disposable workspace,
-lets a Cursor agent attempt the issue, mounts the held-out test afterward, and
-records the patch, test result, duration, and token usage as JSONL:
+The composed command creates a paid agent attempt, persists its patch, destroys
+the agent workspace, then scores that patch in a fresh checkout:
 
 ```bash
 uv run agent-eval run tasks/click/click-3449/task.yaml --model "your-model-id"
 ```
 
-The held-out tests are public benchmark assets, but they must not be mounted in
-the agent's workspace until its attempt is complete.
+Generation and scoring can also run separately. Rescoring never calls the model:
+
+```bash
+uv run agent-eval attempt tasks/click/click-3449/task.yaml \
+  --model "your-model-id" --output artifacts/runs/my-run
+uv run agent-eval score tasks/click/click-3449/task.yaml \
+  artifacts/runs/my-run/patch.diff
+```
+
+Each attempt directory contains `patch.diff`, `agent-output.txt`,
+`metadata.json`, and `trace.jsonl`. The held-out tests are only installed in the
+fresh scorer workspace; the agent workspace is destroyed before scoring starts.
 
 Events are appended to `artifacts/evaluations.jsonl` by default. Use
 `--trace-file PATH` to choose another destination. Cost is recorded when the

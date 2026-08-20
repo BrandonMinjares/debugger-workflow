@@ -1,19 +1,22 @@
 import json
 from pathlib import Path
 
-from agent_debugger_evals.models import EvaluationResult
+from agent_debugger_evals.models import EvaluationStatus, ScoreResult
 from agent_debugger_evals.tracing import JsonlTracer
 
 
 def test_jsonl_tracer_appends_serialized_dataclasses(tmp_path: Path) -> None:
     output = tmp_path / "nested" / "trace.jsonl"
     tracer = JsonlTracer(output)
-    result = EvaluationResult(
+    result = ScoreResult(
         task_id="task-1",
+        status=EvaluationStatus.PASSED,
         passed=True,
         exit_code=0,
         duration_seconds=1.5,
-        patch="diff",
+        test_output="passed",
+        environment_hash="abc123",
+        patch_path=tmp_path / "patch.diff",
     )
 
     tracer.record("evaluation_completed", result)
