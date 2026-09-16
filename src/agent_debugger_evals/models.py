@@ -72,6 +72,28 @@ class ScoreResult:
     patch_path: Path
 
 
+class JudgeLabel(StrEnum):
+    """Fixed failure-mode labels returned by an LLM judge."""
+
+    LOGIC_ERROR = "logic_error"
+    WRONG_SCOPE = "wrong_scope"
+    HALLUCINATED_API = "hallucinated_api"
+    INCOMPLETE_FIX = "incomplete_fix"
+    TEST_ONLY_CHANGE = "test_only_change"
+    SETUP_ISSUE = "setup_issue"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class JudgeResult:
+    """Diagnostic classification that does not affect pass/fail."""
+
+    label: JudgeLabel
+    rationale: str
+    model: str
+    skipped: bool = False
+
+
 @dataclass(frozen=True)
 class EvaluationResult:
     """Combined agent-attempt and independent-scoring result."""
@@ -80,6 +102,7 @@ class EvaluationResult:
     status: EvaluationStatus
     attempt: AttemptResult
     score: ScoreResult
+    judge: JudgeResult | None = None
 
     @property
     def passed(self) -> bool:

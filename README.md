@@ -14,6 +14,7 @@ src/agent_debugger_evals/
   sandbox.py                 Isolated checkout interface
   runner.py                  Attempt generation and independent scoring
   scoring.py                 Deterministic test scoring
+  judge.py                   Optional LLM failure classification
   tracing.py                 Structured JSONL traces
 dashboard/                   Future trace and regression UI
 tests/                       Harness unit tests
@@ -58,3 +59,19 @@ Each task may declare a `setup_command` and `setup_timeout_seconds`. Setup runs
 inside the disposable checkout before the agent starts, so repository
 dependencies are isolated from the harness environment. The Click task uses
 `uv sync` to create its own `.venv`, then scores with `uv run pytest`.
+
+## Optional failure judge
+
+Deterministic scoring never calls an LLM. After a failed score, you can ask an
+OpenAI model to classify the failure mode. Pass/fail is still the held-out
+tests; the judge only writes `judge.json` and a `judge_completed` trace event.
+
+```bash
+export OPENAI_API_KEY="sk-..."
+uv run agent-eval run tasks/click/click-3449/task.yaml \
+  --model "your-model-id" --judge
+uv run agent-eval judge tasks/click/click-3449/task.yaml artifacts/runs/my-run
+```
+
+`score` remains unpaid and model-free. `--judge` is off by default and requires
+`OPENAI_API_KEY` before a paid coding-agent attempt starts.

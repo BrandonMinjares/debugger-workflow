@@ -4,8 +4,14 @@ from typing import Annotated, NoReturn
 import typer
 
 from .agent import AgentExecutionError, CursorCodingAgent
-from .artifacts import ArtifactError, RunArtifactStore
-from .models import EvaluationStatus
+from .artifacts import ArtifactError, RunArtifactStore, save_judge
+from .judge import (
+    DEFAULT_JUDGE_MODEL,
+    JudgeError,
+    OpenAIFailureJudge,
+    load_score_from_trace,
+)
+from .models import EvaluationStatus, JudgeResult
 from .runner import (
     AttemptRunner,
     EvaluationRunner,
@@ -99,15 +105,27 @@ def run(
         Path | None,
         typer.Option(help="Exact directory for persisted run artifacts."),
     ] = None,
+    judge: Annotated[
+        bool,
+        typer.Option(help="Classify failed patches with an OpenAI judge."),
+    ] = False,
+    judge_model: Annotated[
+        str,
+        typer.Option(help="OpenAI model ID used by the failure judge."),
+    ] = DEFAULT_JUDGE_MODEL,
 ) -> None:
     """Create an attempt, then score its patch in a fresh checkout."""
     task = load_task(task_file)
+    failure_judge = None
+    if judge:
+        failure_judge = _require_openai_judge(judge_model)
     runner = EvaluationRunner(
         agent=CursorCodingAgent(model),
         agent_sandbox=LocalSandbox(),
         scorer_sandbox=LocalSandbox(),
         artifact_store=RunArtifactStore(),
         tracer=JsonlTracer(trace_file),
+        judge=failure_judge,
     )
 
     try:
@@ -133,9 +151,66 @@ def run(
     if result.attempt.cost_usd is not None:
         typer.echo(f"Cost: ${result.attempt.cost_usd:.4f}")
     typer.echo(f"Trace: {trace_file}")
+    _echo_judge(result.judge)
 
     if not result.passed:
         raise typer.Exit(code=1)
+
+
+@app.command()
+def judge(
+    task_file: Path,
+    run_dir: Path,
+    judge_model: Annotated[
+        str,
+        typer.Option(help="OpenAI model ID used by the failure judge."),
+    ] = DEFAULT_JUDGE_MODEL,
+) -> None:
+    """Classify a previously scored failed patch without calling a coding agent."""
+    task = load_task(task_file)
+    patch_path = run_dir / "patch.diff"
+    if not patch_path.is_file():
+        _exit_with_error(
+            JudgeError(f"Patch does not exist: {patch_path}"),
+            EvaluationStatus.SCORER_ERROR,
+        )
+
+    try:
+        score = load_score_from_trace(run_dir / "trace.jsonl")
+        if score.passed:
+            typer.echo("JUDGE: skipped because the patch passed held-out tests")
+            raise typer.Exit(code=0)
+        result = _require_openai_judge(judge_model).classify(
+            problem=task.problem,
+            patch=patch_path.read_text(encoding="utf-8"),
+            test_output=score.test_output,
+            status=score.status,
+        )
+        save_judge(run_dir, result)
+        tracer = JsonlTracer(run_dir / "trace.jsonl")
+        tracer.record("judge_completed", result)
+    except (OSError, ArtifactError, JudgeError) as error:
+        _exit_with_error(error, EvaluationStatus.SCORER_ERROR)
+
+    _echo_judge(result)
+    typer.echo(f"Wrote: {run_dir / 'judge.json'}")
+
+
+def _require_openai_judge(model: str) -> OpenAIFailureJudge:
+    configured = OpenAIFailureJudge(model=model)
+    if not configured.resolved_api_key():
+        _exit_with_error(
+            JudgeError("OPENAI_API_KEY must be set to run the failure judge"),
+            EvaluationStatus.SCORER_ERROR,
+        )
+    return configured
+
+
+def _echo_judge(result: JudgeResult | None) -> None:
+    if result is None:
+        return
+    typer.echo(f"Judge: {result.label.value} ({result.model})")
+    typer.echo(f"Rationale: {result.rationale}")
 
 
 def _exit_with_error(

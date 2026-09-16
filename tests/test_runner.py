@@ -8,7 +8,14 @@ import pytest
 
 from agent_debugger_evals.agent import AgentResult
 from agent_debugger_evals.artifacts import RunArtifactStore
-from agent_debugger_evals.models import EvaluationStatus, EvaluationTask, TokenUsage
+from agent_debugger_evals.judge import JudgeError
+from agent_debugger_evals.models import (
+    EvaluationStatus,
+    EvaluationTask,
+    JudgeLabel,
+    JudgeResult,
+    TokenUsage,
+)
 from agent_debugger_evals.runner import (
     EvaluationRunner,
     EvaluationRunnerError,
@@ -89,6 +96,47 @@ class FakeAgent:
             ),
             cost_usd=0.01,
         )
+
+
+class FailingAgent:
+    def solve(self, problem: str, workspace: Path) -> AgentResult:
+        return AgentResult(
+            run_id="run-failed",
+            agent_id="agent-failed",
+            status="finished",
+            output="Could not fix it.",
+            duration_seconds=0.2,
+        )
+
+
+class FakeJudge:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str, EvaluationStatus]] = []
+
+    def classify(
+        self,
+        problem: str,
+        patch: str,
+        test_output: str,
+        status: EvaluationStatus,
+    ) -> JudgeResult:
+        self.calls.append((problem, patch, test_output, status))
+        return JudgeResult(
+            label=JudgeLabel.INCOMPLETE_FIX,
+            rationale="Held-out tests still fail.",
+            model="fake-judge",
+        )
+
+
+class BrokenJudge:
+    def classify(
+        self,
+        problem: str,
+        patch: str,
+        test_output: str,
+        status: EvaluationStatus,
+    ) -> JudgeResult:
+        raise JudgeError("judge unavailable")
 
 
 def test_runner_persists_attempt_then_scores_fresh_workspace(tmp_path: Path) -> None:
@@ -286,3 +334,107 @@ def test_runner_reports_failed_environment_setup(tmp_path: Path) -> None:
 
     with pytest.raises(EvaluationRunnerError, match="exited with code 7"):
         EvaluationRunner._prepare_environment(task, tmp_path)
+
+
+def _cloned_task_workspaces(tmp_path: Path) -> tuple[EvaluationTask, Path, Path]:
+    source = tmp_path / "source"
+    commit = initialize_repository(source)
+    agent_workspace = tmp_path / "agent-workspace"
+    scorer_workspace = tmp_path / "scorer-workspace"
+    run_git(tmp_path, "clone", "--quiet", str(source), str(agent_workspace))
+    run_git(tmp_path, "clone", "--quiet", str(source), str(scorer_workspace))
+    task = EvaluationTask(
+        id="judge-test",
+        repository=str(source),
+        base_commit=commit,
+        problem="Set the value to two.",
+        setup_command=(
+            'python -c "from pathlib import Path; '
+            "Path('.setup-ready').write_text('ready')\""
+        ),
+        test_command="python -m pytest -q test_base.py",
+        timeout_seconds=30,
+    )
+    return task, agent_workspace, scorer_workspace
+
+
+def test_runner_judge_classifies_failures_without_changing_score(
+    tmp_path: Path,
+) -> None:
+    task, agent_workspace, scorer_workspace = _cloned_task_workspaces(tmp_path)
+    judge = FakeJudge()
+    artifact_dir = tmp_path / "artifacts" / "run-failed"
+    trace_file = tmp_path / "evaluation.jsonl"
+
+    result = EvaluationRunner(
+        agent=FailingAgent(),
+        agent_sandbox=FakeSandbox(agent_workspace),
+        scorer_sandbox=FakeSandbox(scorer_workspace),
+        artifact_store=RunArtifactStore(tmp_path / "artifacts"),
+        tracer=JsonlTracer(trace_file),
+        judge=judge,
+    ).run(task, artifact_dir)
+
+    assert result.status is EvaluationStatus.TEST_FAILED
+    assert not result.passed
+    assert result.score.status is EvaluationStatus.TEST_FAILED
+    assert result.judge is not None
+    assert result.judge.label is JudgeLabel.INCOMPLETE_FIX
+    assert len(judge.calls) == 1
+    assert (artifact_dir / "judge.json").is_file()
+
+    events = [
+        json.loads(line)["event"]
+        for line in result.attempt.trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert events.index("scoring_completed") < events.index("judge_completed")
+
+
+def test_runner_skips_judge_when_tests_pass(tmp_path: Path) -> None:
+    task, agent_workspace, scorer_workspace = _cloned_task_workspaces(tmp_path)
+    judge = FakeJudge()
+    artifact_dir = tmp_path / "artifacts" / "run-123"
+    agent = FakeAgent()
+
+    result = EvaluationRunner(
+        agent=agent,
+        agent_sandbox=FakeSandbox(agent_workspace),
+        scorer_sandbox=FakeSandbox(scorer_workspace),
+        artifact_store=RunArtifactStore(tmp_path / "artifacts"),
+        tracer=JsonlTracer(tmp_path / "evaluation.jsonl"),
+        judge=judge,
+    ).run(task, artifact_dir)
+
+    assert result.passed
+    assert result.judge is None
+    assert judge.calls == []
+    assert not (artifact_dir / "judge.json").exists()
+    events = [
+        json.loads(line)["event"]
+        for line in result.attempt.trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert "judge_skipped" in events
+
+
+def test_runner_keeps_score_when_judge_fails(tmp_path: Path) -> None:
+    task, agent_workspace, scorer_workspace = _cloned_task_workspaces(tmp_path)
+    artifact_dir = tmp_path / "artifacts" / "run-failed"
+    trace_file = tmp_path / "evaluation.jsonl"
+
+    result = EvaluationRunner(
+        agent=FailingAgent(),
+        agent_sandbox=FakeSandbox(agent_workspace),
+        scorer_sandbox=FakeSandbox(scorer_workspace),
+        artifact_store=RunArtifactStore(tmp_path / "artifacts"),
+        tracer=JsonlTracer(trace_file),
+        judge=BrokenJudge(),
+    ).run(task, artifact_dir)
+
+    assert result.status is EvaluationStatus.TEST_FAILED
+    assert result.judge is None
+    assert not (artifact_dir / "judge.json").exists()
+    events = [
+        json.loads(line)["event"]
+        for line in result.attempt.trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert "judge_failed" in events

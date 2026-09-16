@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from agent_debugger_evals.agent import AgentResult
-from agent_debugger_evals.artifacts import ArtifactError, RunArtifactStore
+from agent_debugger_evals.artifacts import ArtifactError, RunArtifactStore, save_judge
 from agent_debugger_evals.models import EvaluationTask
 
 
@@ -41,3 +41,22 @@ def test_artifact_store_persists_immutable_attempt_files(tmp_path: Path) -> None
         store.save(task, agent_result, "replacement\n")
 
     assert attempt.patch_path.read_text(encoding="utf-8") == "diff contents\n"
+
+
+def test_save_judge_writes_sidecar_json(tmp_path: Path) -> None:
+    from agent_debugger_evals.models import JudgeLabel, JudgeResult
+
+    artifact_dir = tmp_path / "run-123"
+    artifact_dir.mkdir()
+    path = save_judge(
+        artifact_dir,
+        JudgeResult(
+            label=JudgeLabel.LOGIC_ERROR,
+            rationale="Off-by-one.",
+            model="gpt-4o-mini",
+        ),
+    )
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["label"] == "logic_error"
+    assert payload["schema_version"] == 1

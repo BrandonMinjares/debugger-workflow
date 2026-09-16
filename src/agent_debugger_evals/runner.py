@@ -7,12 +7,14 @@ import time
 from pathlib import Path
 
 from .agent import CodingAgent
-from .artifacts import RunArtifactStore, task_fingerprint
+from .artifacts import ArtifactError, RunArtifactStore, save_judge, task_fingerprint
+from .judge import FailureJudge, JudgeError
 from .models import (
     AttemptResult,
     EvaluationResult,
     EvaluationStatus,
     EvaluationTask,
+    JudgeResult,
     ScoreResult,
 )
 from .sandbox import Sandbox
@@ -42,6 +44,7 @@ class EvaluationRunner:
         scorer_sandbox: Sandbox,
         artifact_store: RunArtifactStore | None = None,
         tracer: JsonlTracer | None = None,
+        judge: FailureJudge | None = None,
     ) -> None:
         self.attempt_runner = AttemptRunner(
             agent,
@@ -51,6 +54,7 @@ class EvaluationRunner:
         )
         self.patch_scorer = PatchScorer(scorer_sandbox)
         self.tracer = tracer
+        self.judge = judge
 
     def run(
         self,
@@ -82,6 +86,7 @@ class EvaluationRunner:
                 ),
                 attempt=attempt,
                 score=score,
+                judge=self._maybe_judge(task, attempt, score),
             )
             self._record("evaluation_completed", evaluation)
             return evaluation
@@ -95,6 +100,56 @@ class EvaluationRunner:
                 },
             )
             raise
+
+    def _maybe_judge(
+        self,
+        task: EvaluationTask,
+        attempt: AttemptResult,
+        score: ScoreResult,
+    ) -> JudgeResult | None:
+        if self.judge is None:
+            return None
+        attempt_tracer = JsonlTracer(attempt.trace_path)
+        if score.passed:
+            self._record_judge(
+                attempt_tracer,
+                "judge_skipped",
+                {"task_id": task.id, "reason": "passed"},
+            )
+            return None
+
+        try:
+            patch = attempt.patch_path.read_text(encoding="utf-8")
+            result = self.judge.classify(
+                problem=task.problem,
+                patch=patch,
+                test_output=score.test_output,
+                status=score.status,
+            )
+        except (OSError, ArtifactError, JudgeError) as error:
+            self._record_judge(
+                attempt_tracer,
+                "judge_failed",
+                {
+                    "task_id": task.id,
+                    "error_type": type(error).__name__,
+                    "message": str(error),
+                },
+            )
+            return None
+
+        save_judge(attempt.artifact_dir, result)
+        self._record_judge(attempt_tracer, "judge_completed", result)
+        return result
+
+    def _record_judge(
+        self,
+        attempt_tracer: JsonlTracer,
+        event: str,
+        payload: object,
+    ) -> None:
+        attempt_tracer.record(event, payload)
+        self._record(event, payload)
 
     def _record(self, event: str, payload: object) -> None:
         if self.tracer is not None:

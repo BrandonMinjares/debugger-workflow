@@ -4,7 +4,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .agent import AgentResult
-from .models import AttemptResult, EvaluationStatus, EvaluationTask
+from .models import AttemptResult, EvaluationStatus, EvaluationTask, JudgeResult
 from .tracing import JsonlTracer
 
 
@@ -119,3 +119,20 @@ class RunArtifactStore:
             usage=agent_result.usage,
             cost_usd=agent_result.cost_usd,
         )
+
+
+def save_judge(artifact_dir: Path, result: JudgeResult) -> Path:
+    """Persist a diagnostic judge result next to immutable attempt files."""
+    judge_path = artifact_dir / "judge.json"
+    payload = {
+        "schema_version": 1,
+        **asdict(result),
+    }
+    try:
+        judge_path.write_text(
+            json.dumps(payload, indent=2, default=str) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as error:
+        raise ArtifactError(f"Could not write judge artifact: {judge_path}") from error
+    return judge_path
