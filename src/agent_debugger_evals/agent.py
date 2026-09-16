@@ -5,7 +5,7 @@ from typing import Protocol
 
 from cursor_sdk import Agent, AgentOptions, CursorAgentError, LocalAgentOptions
 
-from .models import TokenUsage
+from .models import EvaluationStatus, TokenUsage
 
 
 @dataclass(frozen=True)
@@ -23,6 +23,8 @@ class AgentResult:
 
 class AgentExecutionError(RuntimeError):
     """Raised when an agent run cannot be started."""
+
+    status = EvaluationStatus.AGENT_ERROR
 
 
 class CodingAgent(Protocol):

@@ -1,5 +1,5 @@
 """Reproducible evaluation and debugging tools for coding agents."""
 
-from .models import EvaluationResult, EvaluationTask
+from .models import AttemptResult, EvaluationResult, EvaluationTask, ScoreResult
 
-__all__ = ["EvaluationResult", "EvaluationTask"]
+__all__ = ["AttemptResult", "EvaluationResult", "EvaluationTask", "ScoreResult"]

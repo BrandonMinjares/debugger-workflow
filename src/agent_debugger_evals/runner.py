@@ -1,3 +1,5 @@
+import hashlib
+import json
 import shlex
 import shutil
 import subprocess
@@ -5,7 +7,16 @@ import time
 from pathlib import Path
 
 from .agent import CodingAgent
-from .models import EvaluationResult, EvaluationTask
+from .artifacts import ArtifactError, RunArtifactStore, save_judge, task_fingerprint
+from .judge import FailureJudge, JudgeError
+from .models import (
+    AttemptResult,
+    EvaluationResult,
+    EvaluationStatus,
+    EvaluationTask,
+    JudgeResult,
+    ScoreResult,
+)
 from .sandbox import Sandbox
 from .scoring import score_test_run
 from .tracing import JsonlTracer
@@ -14,22 +25,42 @@ from .tracing import JsonlTracer
 class EvaluationRunnerError(RuntimeError):
     """Raised when evaluation infrastructure cannot complete a run."""
 
+    status = EvaluationStatus.SCORER_ERROR
+
+
+class InvalidPatchError(EvaluationRunnerError):
+    """Raised when a persisted patch is unsafe or cannot be applied."""
+
+    status = EvaluationStatus.INVALID_PATCH
+
 
 class EvaluationRunner:
-    """Coordinates the agent, sandbox, tracing, and deterministic scorer."""
+    """Compose a paid attempt with independent fresh-checkout scoring."""
 
     def __init__(
         self,
         agent: CodingAgent,
-        sandbox: Sandbox,
+        agent_sandbox: Sandbox,
+        scorer_sandbox: Sandbox,
+        artifact_store: RunArtifactStore | None = None,
         tracer: JsonlTracer | None = None,
+        judge: FailureJudge | None = None,
     ) -> None:
-        self.agent = agent
-        self.sandbox = sandbox
+        self.attempt_runner = AttemptRunner(
+            agent,
+            agent_sandbox,
+            artifact_store or RunArtifactStore(),
+            tracer,
+        )
+        self.patch_scorer = PatchScorer(scorer_sandbox)
         self.tracer = tracer
+        self.judge = judge
 
-    def run(self, task: EvaluationTask) -> EvaluationResult:
-        started_at = time.monotonic()
+    def run(
+        self,
+        task: EvaluationTask,
+        output_dir: Path | None = None,
+    ) -> EvaluationResult:
         self._record(
             "task_started",
             {
@@ -40,47 +71,22 @@ class EvaluationRunner:
         )
 
         try:
-            with self.sandbox.create(task) as workspace:
-                setup_output = self._prepare_environment(task, workspace)
-                if task.setup_command is not None:
-                    self._record(
-                        "environment_prepared",
-                        {
-                            "task_id": task.id,
-                            "command": task.setup_command,
-                            "output": setup_output,
-                        },
-                    )
-                agent_result = self.agent.solve(task.problem, workspace)
-                self._record("agent_completed", agent_result)
-                patch = self._capture_patch(workspace)
-                hidden_tests = self._install_hidden_tests(task, workspace)
-                exit_code, output = self._run_tests(task, workspace, hidden_tests)
-
-            score = score_test_run(exit_code, output)
-            self._record(
-                "tests_completed",
-                {
-                    "task_id": task.id,
-                    "passed": score.passed,
-                    "exit_code": score.exit_code,
-                    "output": score.output,
-                },
+            attempt = self.attempt_runner.create_attempt(task, output_dir)
+            score = self.patch_scorer.score_patch(
+                task,
+                attempt.patch_path,
+                JsonlTracer(attempt.trace_path),
             )
             evaluation = EvaluationResult(
                 task_id=task.id,
-                passed=score.passed,
-                exit_code=score.exit_code,
-                duration_seconds=time.monotonic() - started_at,
-                patch=patch,
-                test_output=score.output,
-                agent_run_id=agent_result.run_id,
-                agent_id=agent_result.agent_id,
-                agent_status=agent_result.status,
-                agent_output=agent_result.output,
-                agent_duration_seconds=agent_result.duration_seconds,
-                usage=agent_result.usage,
-                cost_usd=agent_result.cost_usd,
+                status=(
+                    EvaluationStatus.AGENT_ERROR
+                    if attempt.agent_status != "finished"
+                    else score.status
+                ),
+                attempt=attempt,
+                score=score,
+                judge=self._maybe_judge(task, attempt, score),
             )
             self._record("evaluation_completed", evaluation)
             return evaluation
@@ -94,6 +100,56 @@ class EvaluationRunner:
                 },
             )
             raise
+
+    def _maybe_judge(
+        self,
+        task: EvaluationTask,
+        attempt: AttemptResult,
+        score: ScoreResult,
+    ) -> JudgeResult | None:
+        if self.judge is None:
+            return None
+        attempt_tracer = JsonlTracer(attempt.trace_path)
+        if score.passed:
+            self._record_judge(
+                attempt_tracer,
+                "judge_skipped",
+                {"task_id": task.id, "reason": "passed"},
+            )
+            return None
+
+        try:
+            patch = attempt.patch_path.read_text(encoding="utf-8")
+            result = self.judge.classify(
+                problem=task.problem,
+                patch=patch,
+                test_output=score.test_output,
+                status=score.status,
+            )
+        except (OSError, ArtifactError, JudgeError) as error:
+            self._record_judge(
+                attempt_tracer,
+                "judge_failed",
+                {
+                    "task_id": task.id,
+                    "error_type": type(error).__name__,
+                    "message": str(error),
+                },
+            )
+            return None
+
+        save_judge(attempt.artifact_dir, result)
+        self._record_judge(attempt_tracer, "judge_completed", result)
+        return result
+
+    def _record_judge(
+        self,
+        attempt_tracer: JsonlTracer,
+        event: str,
+        payload: object,
+    ) -> None:
+        attempt_tracer.record(event, payload)
+        self._record(event, payload)
 
     def _record(self, event: str, payload: object) -> None:
         if self.tracer is not None:
@@ -215,3 +271,215 @@ class EvaluationRunner:
                 output = output.decode(errors="replace")
             message = f"Test command timed out after {task.timeout_seconds} seconds"
             return 124, f"{output}\n{message}".lstrip()
+
+
+class AttemptRunner:
+    """Run an agent once and persist its patch before cleanup."""
+
+    def __init__(
+        self,
+        agent: CodingAgent,
+        sandbox: Sandbox,
+        artifact_store: RunArtifactStore,
+        tracer: JsonlTracer | None = None,
+    ) -> None:
+        self.agent = agent
+        self.sandbox = sandbox
+        self.artifact_store = artifact_store
+        self.tracer = tracer
+
+    def create_attempt(
+        self,
+        task: EvaluationTask,
+        output_dir: Path | None = None,
+    ) -> AttemptResult:
+        started_at = time.monotonic()
+        self._record("attempt_started", {"task_id": task.id})
+
+        with self.sandbox.create(task) as workspace:
+            setup_output = EvaluationRunner._prepare_environment(task, workspace)
+            if task.setup_command is not None:
+                self._record(
+                    "agent_environment_prepared",
+                    {
+                        "task_id": task.id,
+                        "command": task.setup_command,
+                        "output": setup_output,
+                    },
+                )
+            agent_result = self.agent.solve(task.problem, workspace)
+            self._record("agent_completed", agent_result)
+            patch = EvaluationRunner._capture_patch(workspace)
+            attempt = self.artifact_store.save(
+                task,
+                agent_result,
+                patch,
+                output_dir,
+                duration_seconds=time.monotonic() - started_at,
+            )
+
+        self._record("attempt_persisted", attempt)
+        return attempt
+
+    def _record(self, event: str, payload: object) -> None:
+        if self.tracer is not None:
+            self.tracer.record(event, payload)
+
+
+class PatchScorer:
+    """Apply a persisted patch to a fresh checkout and score it."""
+
+    _protected_paths = (".git", ".agent-eval-hidden-tests")
+    _environment_files = (
+        ".python-version",
+        "Pipfile.lock",
+        "poetry.lock",
+        "pyproject.toml",
+        "requirements.txt",
+        "uv.lock",
+    )
+
+    def __init__(self, sandbox: Sandbox) -> None:
+        self.sandbox = sandbox
+
+    def score_patch(
+        self,
+        task: EvaluationTask,
+        patch_path: Path,
+        tracer: JsonlTracer | None = None,
+    ) -> ScoreResult:
+        started_at = time.monotonic()
+        self._record(tracer, "scoring_started", {"task_id": task.id})
+        self._validate_task_binding(task, patch_path)
+
+        with self.sandbox.create(task) as workspace:
+            setup_output = EvaluationRunner._prepare_environment(task, workspace)
+            environment_hash = self._environment_hash(task, workspace)
+            self._record(
+                tracer,
+                "scorer_environment_prepared",
+                {
+                    "task_id": task.id,
+                    "command": task.setup_command,
+                    "output": setup_output,
+                    "environment_hash": environment_hash,
+                },
+            )
+            self._apply_patch(workspace, patch_path)
+            hidden_tests = EvaluationRunner._install_hidden_tests(task, workspace)
+            exit_code, output = EvaluationRunner._run_tests(
+                task,
+                workspace,
+                hidden_tests,
+            )
+
+        score = score_test_run(exit_code, output)
+        result = ScoreResult(
+            task_id=task.id,
+            status=(
+                EvaluationStatus.PASSED
+                if score.passed
+                else EvaluationStatus.TEST_FAILED
+            ),
+            passed=score.passed,
+            exit_code=score.exit_code,
+            duration_seconds=time.monotonic() - started_at,
+            test_output=score.output,
+            environment_hash=environment_hash,
+            patch_path=patch_path,
+        )
+        self._record(tracer, "scoring_completed", result)
+        return result
+
+    @staticmethod
+    def _validate_task_binding(
+        task: EvaluationTask,
+        patch_path: Path,
+    ) -> None:
+        metadata_path = patch_path.parent / "metadata.json"
+        if not metadata_path.is_file():
+            return
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise InvalidPatchError(
+                f"Could not read patch metadata: {metadata_path}"
+            ) from error
+        expected = task_fingerprint(task)
+        if metadata.get("task_fingerprint") != expected:
+            raise InvalidPatchError(
+                "Patch artifact was created for a different task definition"
+            )
+
+    @classmethod
+    def _apply_patch(cls, workspace: Path, patch_path: Path) -> None:
+        if not patch_path.is_file():
+            raise InvalidPatchError(f"Patch does not exist: {patch_path}")
+        if patch_path.stat().st_size == 0:
+            return
+
+        for arguments in (
+            [
+                "git",
+                "apply",
+                "--check",
+                "--index",
+                "--binary",
+                str(patch_path.resolve()),
+            ],
+            [
+                "git",
+                "apply",
+                "--index",
+                "--binary",
+                str(patch_path.resolve()),
+            ],
+        ):
+            try:
+                subprocess.run(
+                    arguments,
+                    cwd=workspace,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            except subprocess.CalledProcessError as error:
+                detail = error.stderr.strip() or str(error)
+                raise InvalidPatchError(f"Patch could not be applied: {detail}") from error
+
+        changed = subprocess.run(
+            ["git", "diff", "--name-only", "-z", "HEAD"],
+            cwd=workspace,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.split("\0")
+        for path in filter(None, changed):
+            if path in cls._protected_paths or path.startswith(
+                tuple(f"{prefix}/" for prefix in cls._protected_paths)
+            ):
+                raise InvalidPatchError(f"Patch modifies protected path: {path}")
+
+    @classmethod
+    def _environment_hash(
+        cls,
+        task: EvaluationTask,
+        workspace: Path,
+    ) -> str:
+        digest = hashlib.sha256()
+        digest.update(task_fingerprint(task).encode())
+        for name in cls._environment_files:
+            path = workspace / name
+            if path.is_file():
+                digest.update(name.encode())
+                digest.update(path.read_bytes())
+        return digest.hexdigest()
+
+    @staticmethod
+    def _record(
+        tracer: JsonlTracer | None,
+        event: str,
+        payload: object,
+    ) -> None:
+        if tracer is not None:
+            tracer.record(event, payload)
